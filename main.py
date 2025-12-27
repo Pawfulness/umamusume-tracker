@@ -128,9 +128,10 @@ def fetch_gametora_data():
                     
                     if image_url:
                         new_data["banners"].append({
-                            "image": image_url,
-                            "link": link,
-                            "text": text_content
+                            "imageUrl": image_url,
+                            "url": link,
+                            "title": "Gacha Banner",
+                            "subtitle": text_content
                         })
 
         # Parse Events
@@ -169,9 +170,9 @@ def fetch_gametora_data():
 
                     new_data["events"].append({
                         "title": title,
-                        "image": image_url,
-                        "link": link,
-                        "time": time_text
+                        "imageUrl": image_url,
+                        "url": link,
+                        "subtitle": time_text
                     })
         else:
             # Fallback: Look for links with /missions in href that are not in the nav
@@ -210,7 +211,7 @@ def register_service():
             "name": "Umamusume Events",
             "description": "Global server banners and events",
             "url": "http://raspberrypi.local:8003",
-            "api_url": "http://raspberrypi.local:8003/api/events",
+            "apiUrl": "http://raspberrypi.local:8003/api/events",
             "type": "split-slide", # Use the new split-slide type we added for Fortnite
             "icon": "horse-head" # FontAwesome icon name (hope it exists or generic)
         }
@@ -245,7 +246,20 @@ def register_service():
 
 @app.get("/api/events")
 def get_events():
-    return events_cache
+    return {
+        "slides": [
+            {
+                "type": "split-slide",
+                "title": "Current Banners",
+                "subtitle": "Gacha",
+                "items": events_cache["banners"],
+                "rightTitle": "Mission Events",
+                "rightSubtitle": "Limited Time",
+                "rightItems": events_cache["events"]
+            }
+        ],
+        "last_updated": events_cache["last_updated"]
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8003)
