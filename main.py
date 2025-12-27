@@ -9,7 +9,6 @@ import json
 import os
 from datetime import datetime
 import logging
-from datetime import timezone
 
 # Configure logging
 logging.basicConfig(
@@ -33,8 +32,134 @@ app.add_middleware(
 events_cache = {
     "banners": [],
     "events": [],
+    "upcoming_banners": [],
+    "upcoming_events": [],
     "last_updated": None
 }
+
+
+def _format_dt(ts_seconds: int | None) -> str:
+    if not ts_seconds:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(ts_seconds))
+        # Day without leading zero, short month, 24h time
+        return dt.strftime('%d %b %Y, %H:%M').lstrip('0')
+    except Exception:
+        return ""
+
+
+def _parse_next_data(page_soup: BeautifulSoup) -> dict:
+    script = page_soup.find('script', id='__NEXT_DATA__')
+    if not script or not script.string:
+        return {}
+    try:
+        obj = json.loads(script.string)
+        return obj.get('props', {}).get('pageProps', {}) or {}
+    except Exception:
+        return {}
+
+
+def _extract_event_banner_image_url(event_page_soup: BeautifulSoup) -> str:
+    # Event pages typically include a banner image like:
+    # /images/umamusume/events/2025/07_summer_days_graffiti_banner.png
+    img = event_page_soup.find('img', src=lambda s: s and '/images/umamusume/events/' in s and s.endswith('_banner.png'))
+    if not img:
+        return ""
+    src = img.get('src') or ""
+    if not src:
+        return ""
+    if src.startswith('http'):
+        return src
+    return f"https://gametora.com{src}"
+
+
+def fetch_story_events(limit: int = 5) -> tuple[list[dict], list[dict]]:
+    """Returns (current_events, upcoming_events) for the EN site.
+
+    GameTora's Story Event list is server-rendered enough to enumerate event URLs.
+    Each event page contains eventData (start/end/name_en) in __NEXT_DATA__.
+    """
+
+    list_url = "https://gametora.com/umamusume/events/story-events"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    }
+
+    try:
+        resp = requests.get(list_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"Failed to fetch story events list: {e}")
+        return [], []
+
+    soup = BeautifulSoup(resp.content, 'html.parser')
+
+    # Collect unique event slugs from links
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for a in soup.find_all('a', href=True):
+        href = a.get('href') or ""
+        if not href.startswith('/umamusume/events/'):
+            continue
+        if href in ('/umamusume/events', '/umamusume/events/story-events'):
+            continue
+        slug = href.split('/umamusume/events/', 1)[1].split('?', 1)[0].strip('/')
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        slugs.append(slug)
+
+    now_ts = int(time.time())
+    current: list[dict] = []
+    upcoming: list[dict] = []
+
+    # Cap requests to avoid hammering the site.
+    # The list is fairly complete; scanning the first ~120 is usually enough.
+    for slug in slugs[:120]:
+        page_url = f"https://gametora.com/umamusume/events/{slug}"
+        try:
+            ev_resp = requests.get(page_url, headers=headers, timeout=30)
+            ev_resp.raise_for_status()
+            ev_soup = BeautifulSoup(ev_resp.content, 'html.parser')
+            pp = _parse_next_data(ev_soup)
+            ev = pp.get('eventData') or {}
+            if not isinstance(ev, dict):
+                continue
+
+            start = int(ev.get('start') or 0)
+            end = int(ev.get('end') or 0)
+            name = (ev.get('name_en') or "").strip() or (ev.get('name_jp') or "").strip() or slug.replace('-', ' ').title()
+            image_url = _extract_event_banner_image_url(ev_soup)
+
+            item = {
+                "title": name,
+                "subtitle": "",
+                "url": page_url,
+                "imageUrl": image_url,
+            }
+
+            if start and end and start <= now_ts <= end:
+                item["subtitle"] = f"Ends {_format_dt(end)}"
+                item["_sort"] = end
+                current.append(item)
+            elif start and start > now_ts:
+                item["subtitle"] = f"Starts {_format_dt(start)}"
+                item["_sort"] = start
+                upcoming.append(item)
+
+        except Exception:
+            continue
+
+    current.sort(key=lambda x: x.get('_sort') or 0)
+    upcoming.sort(key=lambda x: x.get('_sort') or 0)
+
+    # Remove sort helper keys
+    for lst in (current, upcoming):
+        for it in lst:
+            it.pop('_sort', None)
+
+    return current[:limit], upcoming[:limit]
 
 def fetch_gametora_data():
     """Scrapes GameTora for current banners and events."""
@@ -60,25 +185,6 @@ def fetch_gametora_data():
         # GameTora is a Next.js app. The server-rendered HTML defaults to JP, and switching to Global
         # happens client-side (JS). Since this service doesn't execute JS, we must read __NEXT_DATA__
         # and explicitly select the EN (Global) region.
-        def _parse_next_data(page_soup: BeautifulSoup) -> dict:
-            script = page_soup.find('script', id='__NEXT_DATA__')
-            if not script or not script.string:
-                return {}
-            try:
-                obj = json.loads(script.string)
-                return obj.get('props', {}).get('pageProps', {}) or {}
-            except Exception:
-                return {}
-
-        def _format_end(end_ts_seconds: int | None) -> str:
-            if not end_ts_seconds:
-                return ""
-            try:
-                # Use local time so it matches the rest of the dashboard.
-                dt = datetime.fromtimestamp(int(end_ts_seconds))
-                return f"Ends {dt.strftime('%d %b %Y, %H:%M').lstrip('0')}"
-            except Exception:
-                return ""
 
         try:
             gacha_resp = requests.get(gacha_url, headers=headers, timeout=30)
@@ -125,7 +231,7 @@ def fetch_gametora_data():
                     "imageUrl": f"https://gametora.com/images/umamusume/gacha/img_bnr_gacha_{banner_id}.png",
                     "url": gacha_url,
                     "title": title,
-                    "subtitle": _format_end(end_ts),
+                    "subtitle": f"Ends {_format_dt(end_ts)}" if end_ts else "",
                 })
 
             for b in char_banners:
@@ -138,6 +244,12 @@ def fetch_gametora_data():
 
         except Exception as e:
             logger.warning(f"Failed to build EN/Global banners from gacha data: {e}")
+
+        # Current + Upcoming story events (best-effort)
+        current_events, upcoming_events = fetch_story_events(limit=5)
+        new_data["events"] = current_events
+        new_data["upcoming_events"] = upcoming_events
+        new_data["upcoming_banners"] = []
         
         # Helper to parse sections
         def parse_section(header_text, target_list):
@@ -231,8 +343,13 @@ def fetch_gametora_data():
         global events_cache
         events_cache["banners"] = new_data["banners"]
         events_cache["events"] = new_data["events"]
+        events_cache["upcoming_banners"] = new_data.get("upcoming_banners", [])
+        events_cache["upcoming_events"] = new_data.get("upcoming_events", [])
         events_cache["last_updated"] = datetime.now().isoformat()
-        logger.info(f"Updated cache: {len(new_data['banners'])} banners, {len(new_data['events'])} events")
+        logger.info(
+            f"Updated cache: {len(new_data['banners'])} banners, {len(new_data['events'])} current events, "
+            f"{len(new_data.get('upcoming_banners', []))} upcoming banners, {len(new_data.get('upcoming_events', []))} upcoming events"
+        )
         
     except Exception as e:
         logger.error(f"Error fetching data: {e}")
@@ -302,9 +419,18 @@ def get_events():
                 "title": "Current Banners",
                 "subtitle": "Gacha",
                 "items": events_cache["banners"],
-                "rightTitle": "Mission Events",
-                "rightSubtitle": "Limited Time",
-                "rightItems": events_cache["events"]
+                "rightTitle": "Current Events",
+                "rightSubtitle": "Story",
+                "rightItems": events_cache["events"],
+            },
+            {
+                "type": "split-slide",
+                "title": "Upcoming Banners",
+                "subtitle": "Gacha",
+                "items": events_cache.get("upcoming_banners", []),
+                "rightTitle": "Upcoming Events",
+                "rightSubtitle": "Story",
+                "rightItems": events_cache.get("upcoming_events", []),
             }
         ],
         "last_updated": events_cache["last_updated"]
