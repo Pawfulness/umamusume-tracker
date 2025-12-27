@@ -9,6 +9,7 @@ import json
 import os
 from datetime import datetime
 import logging
+from datetime import timezone
 
 # Configure logging
 logging.basicConfig(
@@ -41,7 +42,6 @@ def fetch_gametora_data():
     gacha_url = "https://gametora.com/umamusume/gacha"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Cookie": "umamusume_server=gl"  # Force Global server
     }
     
     try:
@@ -50,49 +50,94 @@ def fetch_gametora_data():
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
-
-        # The /umamusume landing page doesn't include human-readable banner names.
-        # We build a best-effort map from the /umamusume/gacha listing instead.
-        gacha_title_by_image: dict[str, str] = {}
-        try:
-            gacha_resp = requests.get(gacha_url, headers=headers, timeout=30)
-            gacha_resp.raise_for_status()
-            gacha_soup = BeautifulSoup(gacha_resp.content, 'html.parser')
-
-            for img in gacha_soup.find_all('img'):
-                src = img.get('src') or ''
-                if '/images/umamusume/gacha/img_bnr_gacha_' not in src:
-                    continue
-
-                image_abs = src
-                if not image_abs.startswith('http'):
-                    image_abs = f"https://gametora.com{image_abs}"
-
-                # Find the nearest card container and extract the label (usually "Character Gacha" or "Support Card Gacha").
-                card = img.find_parent('div')
-                title_text = ""
-                if card:
-                    # Prefer a short label ending with "Gacha".
-                    label = card.find(lambda t: t.name == 'div' and (t.get_text(strip=True) or '').endswith('Gacha'))
-                    if label:
-                        title_text = label.get_text(' ', strip=True)
-                    else:
-                        # Fallback: take the first non-empty text chunk within the card.
-                        for t in card.find_all(['div', 'span'], recursive=True):
-                            txt = t.get_text(' ', strip=True)
-                            if txt:
-                                title_text = txt
-                                break
-
-                if title_text:
-                    gacha_title_by_image[image_abs] = title_text
-        except Exception as e:
-            logger.warning(f"Failed to fetch gacha listing for banner titles: {e}")
         
         new_data = {
             "banners": [],
             "events": []
         }
+
+        # IMPORTANT:
+        # GameTora is a Next.js app. The server-rendered HTML defaults to JP, and switching to Global
+        # happens client-side (JS). Since this service doesn't execute JS, we must read __NEXT_DATA__
+        # and explicitly select the EN (Global) region.
+        def _parse_next_data(page_soup: BeautifulSoup) -> dict:
+            script = page_soup.find('script', id='__NEXT_DATA__')
+            if not script or not script.string:
+                return {}
+            try:
+                obj = json.loads(script.string)
+                return obj.get('props', {}).get('pageProps', {}) or {}
+            except Exception:
+                return {}
+
+        def _format_end(end_ts_seconds: int | None) -> str:
+            if not end_ts_seconds:
+                return ""
+            try:
+                # Use local time so it matches the rest of the dashboard.
+                dt = datetime.fromtimestamp(int(end_ts_seconds))
+                return f"Ends {dt.strftime('%d %b %Y, %H:%M').lstrip('0')}"
+            except Exception:
+                return ""
+
+        try:
+            gacha_resp = requests.get(gacha_url, headers=headers, timeout=30)
+            gacha_resp.raise_for_status()
+            gacha_soup = BeautifulSoup(gacha_resp.content, 'html.parser')
+            gacha_props = _parse_next_data(gacha_soup)
+
+            region = "en"  # Global server / English
+
+            char_cards = {c.get('id'): c for c in (gacha_props.get('charCardData', {}).get(region) or []) if isinstance(c, dict)}
+            support_cards = {c.get('id'): c for c in (gacha_props.get('supportCardData', {}).get(region) or []) if isinstance(c, dict)}
+
+            char_banners = (gacha_props.get('currentCharBanners', {}).get(region) or [])
+            support_banners = (gacha_props.get('currentSupportBanners', {}).get(region) or [])
+
+            def _pickup_names(pickups, cards_by_id):
+                ids = []
+                for p in pickups or []:
+                    if isinstance(p, (list, tuple)) and p:
+                        ids.append(p[0])
+                names = []
+                for pid in ids:
+                    card = cards_by_id.get(pid) or {}
+                    nm = card.get('name')
+                    if nm:
+                        names.append(nm)
+                # keep unique order
+                seen = set()
+                uniq = []
+                for n in names:
+                    if n in seen:
+                        continue
+                    seen.add(n)
+                    uniq.append(n)
+                return uniq
+
+            def _add_banner(banner_id: int, end_ts: int | None, kind: str, pickups, cards_by_id):
+                names = _pickup_names(pickups, cards_by_id)
+                title = kind
+                if names:
+                    title = f"{kind} — {' / '.join(names[:2])}"
+
+                new_data["banners"].append({
+                    "imageUrl": f"https://gametora.com/images/umamusume/gacha/img_bnr_gacha_{banner_id}.png",
+                    "url": gacha_url,
+                    "title": title,
+                    "subtitle": _format_end(end_ts),
+                })
+
+            for b in char_banners:
+                if isinstance(b, dict) and b.get('id'):
+                    _add_banner(int(b['id']), b.get('end'), "Character Gacha", b.get('pickups'), char_cards)
+
+            for b in support_banners:
+                if isinstance(b, dict) and b.get('id'):
+                    _add_banner(int(b['id']), b.get('end'), "Support Card Gacha", b.get('pickups'), support_cards)
+
+        except Exception as e:
+            logger.warning(f"Failed to build EN/Global banners from gacha data: {e}")
         
         # Helper to parse sections
         def parse_section(header_text, target_list):
@@ -136,43 +181,7 @@ def fetch_gametora_data():
                 
                 current_element = current_element.find_next_sibling()
 
-        # Parse Banners
-        banner_header = soup.find(lambda tag: tag.name == "h2" and "Current Gacha Banners" in tag.text)
-        if banner_header:
-            # The structure is h2 + div > div > (a + div)
-            container = banner_header.find_next_sibling('div')
-            if container:
-                for item_div in container.find_all('div', recursive=False):
-                    # Link and Image
-                    link_tag = item_div.find('a')
-                    if not link_tag:
-                        continue
-                        
-                    link = link_tag.get('href')
-                    if not link.startswith('http'):
-                        link = f"https://gametora.com{link}"
-                    
-                    img = link_tag.find('img')
-                    image_url = ""
-                    if img:
-                        image_url = img.get('src')
-                        if not image_url.startswith('http'):
-                            image_url = f"https://gametora.com{image_url}"
-                    
-                    # Date/Text
-                    text_div = item_div.find('div', class_=lambda x: x and 'text' in x)
-                    text_content = ""
-                    if text_div:
-                        text_content = text_div.get_text(strip=True)
-                    
-                    if image_url:
-                        banner_title = gacha_title_by_image.get(image_url) or "Gacha Banner"
-                        new_data["banners"].append({
-                            "imageUrl": image_url,
-                            "url": link,
-                            "title": banner_title,
-                            "subtitle": text_content
-                        })
+        # NOTE: banners are now sourced from /umamusume/gacha __NEXT_DATA__ (EN region).
 
         # Parse Events
         # Try finding header first
