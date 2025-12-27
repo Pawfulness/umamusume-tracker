@@ -1,0 +1,12 @@
+[Unit]
+Description=Umamusume Tracker Service
+After=network.target
+
+[Service]
+User=admin
+WorkingDirectory=/home/admin/umamusume-tracker
+ExecStart=/home/admin/umamusume-tracker/venv/bin/python main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
