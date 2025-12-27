@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule Umamusume Tracker daily refresh
+
+[Timer]
+OnCalendar=*-*-* 00:01:00
+Persistent=true
+Unit=umamusume-tracker-refresh.service
+
+[Install]
+WantedBy=timers.target
