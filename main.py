@@ -38,6 +38,7 @@ events_cache = {
 def fetch_gametora_data():
     """Scrapes GameTora for current banners and events."""
     url = "https://gametora.com/umamusume"
+    gacha_url = "https://gametora.com/umamusume/gacha"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "Cookie": "umamusume_server=gl"  # Force Global server
@@ -49,6 +50,44 @@ def fetch_gametora_data():
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
+
+        # The /umamusume landing page doesn't include human-readable banner names.
+        # We build a best-effort map from the /umamusume/gacha listing instead.
+        gacha_title_by_image: dict[str, str] = {}
+        try:
+            gacha_resp = requests.get(gacha_url, headers=headers, timeout=30)
+            gacha_resp.raise_for_status()
+            gacha_soup = BeautifulSoup(gacha_resp.content, 'html.parser')
+
+            for img in gacha_soup.find_all('img'):
+                src = img.get('src') or ''
+                if '/images/umamusume/gacha/img_bnr_gacha_' not in src:
+                    continue
+
+                image_abs = src
+                if not image_abs.startswith('http'):
+                    image_abs = f"https://gametora.com{image_abs}"
+
+                # Find the nearest card container and extract the label (usually "Character Gacha" or "Support Card Gacha").
+                card = img.find_parent('div')
+                title_text = ""
+                if card:
+                    # Prefer a short label ending with "Gacha".
+                    label = card.find(lambda t: t.name == 'div' and (t.get_text(strip=True) or '').endswith('Gacha'))
+                    if label:
+                        title_text = label.get_text(' ', strip=True)
+                    else:
+                        # Fallback: take the first non-empty text chunk within the card.
+                        for t in card.find_all(['div', 'span'], recursive=True):
+                            txt = t.get_text(' ', strip=True)
+                            if txt:
+                                title_text = txt
+                                break
+
+                if title_text:
+                    gacha_title_by_image[image_abs] = title_text
+        except Exception as e:
+            logger.warning(f"Failed to fetch gacha listing for banner titles: {e}")
         
         new_data = {
             "banners": [],
@@ -127,10 +166,11 @@ def fetch_gametora_data():
                         text_content = text_div.get_text(strip=True)
                     
                     if image_url:
+                        banner_title = gacha_title_by_image.get(image_url) or "Gacha Banner"
                         new_data["banners"].append({
                             "imageUrl": image_url,
                             "url": link,
-                            "title": "Gacha Banner",
+                            "title": banner_title,
                             "subtitle": text_content
                         })
 
