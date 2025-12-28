@@ -39,6 +39,11 @@ events_cache = {
     "last_updated": None
 }
 
+_uma_char_banner_image_cache: dict[str, object] = {
+    "map": {},
+    "fetched_at": 0,
+}
+
 _refresh_lock = Lock()
 _refresh_in_progress = False
 
@@ -365,6 +370,26 @@ def fetch_game8_upcoming_banners(limit: int = 5) -> list[dict]:
     for r in rows:
         r.pop("_sort", None)
 
+    # Best-effort: attach images for character banners using uma.moe banner images.
+    try:
+        image_map = _get_uma_moe_character_banner_image_map()
+    except Exception:
+        image_map = {}
+
+    if image_map:
+        keys = list(image_map.keys())
+        for r in rows:
+            if (r.get("imageUrl") or "").strip():
+                continue
+            title_l = (r.get("title") or "").lower()
+            title_l = re.sub(r"\s+", " ", title_l).strip()
+            best_key = ""
+            for k in keys:
+                if k and k in title_l and len(k) > len(best_key):
+                    best_key = k
+            if best_key:
+                r["imageUrl"] = str(image_map.get(best_key) or "")
+
     # De-dupe by title
     seen = set()
     out = []
@@ -377,6 +402,63 @@ def fetch_game8_upcoming_banners(limit: int = 5) -> list[dict]:
         if len(out) >= limit:
             break
 
+    return out
+
+
+def _get_uma_moe_character_banner_image_map(ttl_seconds: int = 24 * 3600) -> dict[str, str]:
+    """Return a map of normalized pickup character name -> banner image URL.
+
+    Data comes from uma.moe's timeline chunk (character banner dataset). Cached for 24h.
+    """
+    now_ts = int(time.time())
+    cached_at = int(_uma_char_banner_image_cache.get("fetched_at") or 0)
+    cached_map = _uma_char_banner_image_cache.get("map")
+    if isinstance(cached_map, dict) and cached_map and (now_ts - cached_at) < ttl_seconds:
+        return {str(k): str(v) for k, v in cached_map.items()}
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    chunk_url = _get_uma_moe_timeline_chunk_url()
+    if not chunk_url:
+        return {}
+    js = requests.get(chunk_url, headers=headers, timeout=30).text
+
+    def _norm_name(s: str) -> str:
+        t = (s or "").strip().lower()
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    out: dict[str, str] = {}
+
+    # Extract objects that include pickup_characters + image_path.
+    # Example object fields (minified):
+    # {year:2021,image:"2021_30004.png",...,pickup_characters:["TM Opera O (Original)[New,0.75% rate]"],image_path:"assets/images/character/banner/2021_30004.png",...}
+    for pickups_blob, image_path in re.findall(
+        r"pickup_characters:\[(.*?)\],image_path:\"(assets/images/character/banner/[^\"]+)\"",
+        js,
+        re.S,
+    ):
+        names = re.findall(r"\"(.*?)\"", pickups_blob, re.S)
+        clean = []
+        for n in names:
+            base = (n or "").split("[", 1)[0].strip()
+            if base:
+                clean.append(base)
+        if not clean:
+            continue
+        img_url = _abs_uma_moe_asset(image_path)
+        if not img_url:
+            continue
+        for base in clean:
+            norm = _norm_name(base)
+            out[norm] = img_url
+            # Game8 often lists base character names without the '(Original)' suffix.
+            if norm.endswith(" (original)"):
+                alias = norm[: -len(" (original)")].strip()
+                if alias and alias not in out:
+                    out[alias] = img_url
+
+    _uma_char_banner_image_cache["map"] = out
+    _uma_char_banner_image_cache["fetched_at"] = now_ts
     return out
 
 
