@@ -917,7 +917,9 @@ def fetch_gametora_data():
                     card = cards_by_id.get(pid) or {}
                     nm = card.get('name')
                     if nm:
-                        names.append(nm)
+                        nm = re.sub(r"\s+", " ", str(nm)).strip()
+                        if nm:
+                            names.append(nm)
                 # keep unique order
                 seen = set()
                 uniq = []
@@ -932,13 +934,14 @@ def fetch_gametora_data():
                 names = _pickup_names(pickups, cards_by_id)
                 title = kind
                 if names:
-                    title = f"{kind} — {' / '.join(names[:2])}"
+                    # Put names first so truncated UIs still show something useful.
+                    title = " / ".join(names[:2])
 
                 new_data["banners"].append({
                     "imageUrl": f"https://gametora.com/images/umamusume/gacha/img_bnr_gacha_{banner_id}.png",
                     "url": gacha_url,
                     "title": title,
-                    "subtitle": f"Ends {_format_dt(end_ts)}" if end_ts else "",
+                    "subtitle": f"{kind} · Ends {_format_dt(end_ts)}" if end_ts else kind,
                 })
 
             for b in char_banners:
