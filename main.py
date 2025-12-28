@@ -66,12 +66,28 @@ def _parse_next_data(page_soup: BeautifulSoup) -> dict:
 
 
 def _extract_event_banner_image_url(event_page_soup: BeautifulSoup) -> str:
-    # Event pages typically include a banner image like:
+    # Prefer OG/Twitter image when present (more stable than CSS-rendered images).
+    for sel in [
+        lambda: event_page_soup.find('meta', attrs={'property': 'og:image'}),
+        lambda: event_page_soup.find('meta', attrs={'name': 'twitter:image'}),
+    ]:
+        try:
+            meta = sel()
+        except Exception:
+            meta = None
+        if meta:
+            content = (meta.get('content') or '').strip()
+            if content and '/images/umamusume/events/' in content:
+                if content.startswith('http'):
+                    return content
+                return f"https://gametora.com{content}"
+
+    # Fallback: Event pages usually include a banner image like:
     # /images/umamusume/events/2025/07_summer_days_graffiti_banner.png
-    img = event_page_soup.find('img', src=lambda s: s and '/images/umamusume/events/' in s and s.endswith('_banner.png'))
+    img = event_page_soup.find('img', src=lambda s: s and '/images/umamusume/events/' in s)
     if not img:
         return ""
-    src = img.get('src') or ""
+    src = (img.get('src') or '').strip()
     if not src:
         return ""
     if src.startswith('http'):
@@ -575,6 +591,82 @@ def fetch_uma_moe_upcoming(limit_banners: int = 5, limit_events: int = 5) -> tup
     upcoming_banners: list[dict] = []
     upcoming_events: list[dict] = []
 
+    def _normalize_event_title(s: str) -> str:
+        t = (s or "").strip().lower()
+        if t.startswith("champions meeting:"):
+            t = t.split(":", 1)[1].strip()
+        t = re.sub(r"[^a-z0-9]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _try_resolve_gametora_event_image(title: str) -> str:
+        """Best-effort lookup for an event's banner image on GameTora.
+
+        Used for upcoming items that come from uma.moe (and might not include an image).
+        """
+        want = _normalize_event_title(title)
+        if not want:
+            return ""
+
+        try:
+            idx_html = requests.get("https://gametora.com/umamusume/events", headers=headers, timeout=30).text
+            idx_soup = BeautifulSoup(idx_html, 'html.parser')
+        except Exception:
+            return ""
+
+        slugs: list[str] = []
+        seen: set[str] = set()
+        for a in idx_soup.find_all('a', href=True):
+            href = a.get('href') or ""
+            if not href.startswith('/umamusume/events/'):
+                continue
+            if href in ('/umamusume/events', '/umamusume/events/story-events'):
+                continue
+            slug = href.split('/umamusume/events/', 1)[1].split('?', 1)[0].strip('/')
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+
+        # Cap work to avoid hammering the site. This runs on a daily schedule.
+        for slug in slugs[:80]:
+            page_url = f"https://gametora.com/umamusume/events/{slug}"
+            try:
+                ev_html = requests.get(page_url, headers=headers, timeout=30).text
+                ev_soup = BeautifulSoup(ev_html, 'html.parser')
+                pp = _parse_next_data(ev_soup)
+                ev = pp.get('eventData') or {}
+                if not isinstance(ev, dict):
+                    continue
+                name = (ev.get('name_en') or "").strip() or (ev.get('name_jp') or "").strip()
+                got = _normalize_event_title(name)
+                if not got:
+                    continue
+                if want in got or got in want:
+                    img = _extract_event_banner_image_url(ev_soup)
+                    if img:
+                        return img
+            except Exception:
+                continue
+
+        return ""
+
+    def _get_gametora_champions_meeting_image() -> str:
+        try:
+            html = requests.get("https://gametora.com/umamusume/events/champions-meeting", headers=headers, timeout=30).text
+            soup = BeautifulSoup(html, 'html.parser')
+            img = soup.find('img', src=lambda s: s and '/images/umamusume/events/' in s)
+            if not img:
+                return ""
+            src = (img.get('src') or '').strip()
+            if not src:
+                return ""
+            if src.startswith('http'):
+                return src
+            return f"https://gametora.com{src}"
+        except Exception:
+            return ""
+
     jp_launch = _uma_moe_extract_utc_date(js, "ee")
     global_launch = _uma_moe_extract_utc_date(js, "_e")
     catchup_rate = _uma_moe_extract_number(js, "me")
@@ -624,7 +716,9 @@ def fetch_uma_moe_upcoming(limit_banners: int = 5, limit_events: int = 5) -> tup
 
     # --- Upcoming Champions Meetings (compute Global start dates) ---
     cm_m = re.search(r"var jt=\[(.*?)\];", js, re.S)
+    cm_image = ""
     if cm_m:
+        cm_image = _get_gametora_champions_meeting_image()
         cm_blob = cm_m.group(1)
         cm_rows = re.findall(
             r'\{name:"(.*?)",start_date:"(.*?)",end_date:"(.*?)",track:"(.*?)",distance:"(.*?)",conditions:"(.*?)"\}',
@@ -661,9 +755,16 @@ def fetch_uma_moe_upcoming(limit_banners: int = 5, limit_events: int = 5) -> tup
                 "title": f"Champions Meeting: {it['name']}" if it["name"] else "Champions Meeting",
                 "subtitle": f"Starts {_format_dt(global_ts)} (est)",
                 "url": "https://uma.moe/timeline",
-                "imageUrl": "",
+                "imageUrl": cm_image,
                 "_sort": global_ts,
             })
+
+    # Best-effort: fill missing images (e.g., Champions Meeting) using GameTora.
+    missing = [ev for ev in upcoming_events if not (ev.get('imageUrl') or '').strip()]
+    for ev in missing[:5]:
+        img = _try_resolve_gametora_event_image(ev.get('title') or '')
+        if img:
+            ev['imageUrl'] = img
 
     upcoming_banners.sort(key=lambda x: x.get('_sort') or 0)
     upcoming_events.sort(key=lambda x: x.get('_sort') or 0)
