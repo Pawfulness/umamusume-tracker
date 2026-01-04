@@ -274,16 +274,43 @@ def fetch_game8_upcoming_banners(limit: int = 5) -> list[dict]:
 
     soup = BeautifulSoup(resp.content, 'html.parser')
 
-    # Prefer the first table under "December 2025 Banners" (exact UTC ranges),
-    # then fall back to "Expected Banner Schedule" (estimated releases).
+    # Game8 periodically changes the month heading (e.g., "January 2026 Banners"),
+    # so avoid hard-coding a single month. Collect all banner schedule tables
+    # (month/year headings) plus the "Expected Banner Schedule" table.
     tables: list[BeautifulSoup] = []
-    for heading_text in ["December 2025 Banners", "Expected Banner Schedule"]:
-        h = soup.find(lambda tag: tag.name in ("h2", "h3") and heading_text.lower() in tag.get_text(" ", strip=True).lower())
-        if not h:
-            continue
-        # Next table after the heading
+    seen_tables: set[int] = set()
+
+    def _push_table_after_heading(h) -> None:
         t = h.find_next("table")
-        if t:
+        if not t:
+            return
+        tid = id(t)
+        if tid in seen_tables:
+            return
+        seen_tables.add(tid)
+        tables.append(t)
+
+    for h in soup.find_all(["h2", "h3"]):
+        heading = h.get_text(" ", strip=True)
+        heading_l = heading.lower()
+
+        if "expected banner schedule" in heading_l:
+            _push_table_after_heading(h)
+            continue
+
+        # Common headings: "December 2025 Banners", "January 2026 Banners", etc.
+        if "banner" in heading_l and re.search(r"\b20\d{2}\b", heading):
+            # Keep it broad, but ensure it's actually a banner section.
+            if "banners" in heading_l or "banner schedule" in heading_l:
+                _push_table_after_heading(h)
+
+    # Fallback: if headings weren't found, use the first few tables on the page.
+    if not tables:
+        for t in soup.find_all("table")[:3]:
+            tid = id(t)
+            if tid in seen_tables:
+                continue
+            seen_tables.add(tid)
             tables.append(t)
 
     rows: list[dict] = []
